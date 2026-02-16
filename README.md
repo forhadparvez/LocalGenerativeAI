@@ -7,7 +7,7 @@ python -m venv .venv
 
 
 Need Python 3 and install
-pip install transformers torch accelerate fastapi pydantic uvicorn
+pip install transformers torch accelerate fastapi pydantic uvicorn sentence_transformers chromadb
 
 To Run Fast API
 uvicorn main:app --reload

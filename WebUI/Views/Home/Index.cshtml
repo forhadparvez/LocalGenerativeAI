@@ -5,14 +5,46 @@
 <div class="container mt-4">
     <h2>Local AI Assistant</h2>
 
-    <div id="chatBox" class="border rounded p-3 mb-3"
-         style="height:400px; overflow-y:auto; background:#f8f9fa;">
+    <!-- Document Upload Section -->
+    <div class="card mb-4">
+        <div class="card-header bg-info text-white">
+            <h5 class="mb-0">Add Documents to Knowledge Base</h5>
+        </div>
+        <div class="card-body">
+            <div class="row">
+                <div class="col-md-9">
+                    <textarea id="documentInput" class="form-control" rows="4"
+                              placeholder="Paste your document text here..."></textarea>
+                </div>
+                <div class="col-md-3">
+                    <div class="mb-3">
+                        <label for="documentId" class="form-label">Document ID (optional)</label>
+                        <input type="text" id="documentId" class="form-control"
+                               placeholder="e.g., doc1" />
+                    </div>
+                    <button class="btn btn-success w-100" id="addDocBtn">Add Document</button>
+                    <div id="docStatus" class="mt-2"></div>
+                </div>
+            </div>
+        </div>
     </div>
 
-    <div class="input-group">
-        <input type="text" id="userInput" class="form-control"
-               placeholder="Type your message..." />
-        <button class="btn btn-primary" id="sendBtn">Send</button>
+    <!-- Chat Section -->
+    <div class="card">
+        <div class="card-header">
+            <h5 class="mb-0">Chat</h5>
+        </div>
+        <div class="card-body">
+            <div id="chatBox" class="border rounded p-3 mb-3"
+                 style="height:400px; overflow-y:auto; background:#f8f9fa;">
+            </div>
+
+            <div class="input-group">
+                <input type="text" id="userInput" class="form-control"
+                       placeholder="Type your message..." />
+                <button class="btn btn-primary" id="sendBtn">Send</button>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -24,8 +56,48 @@
 <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
 
 <script>
-    $("#sendBtn").click(function () {
+    // Add Document Function
+    $("#addDocBtn").click(function () {
+        var content = $("#documentInput").val();
+        var docId = $("#documentId").val();
 
+        if (!content) {
+            $("#docStatus").html("<div class='alert alert-warning'>Please enter document text</div>");
+            return;
+        }
+
+        var docData = { content: content };
+        if (docId) {
+            docData.document_id = docId;
+        }
+
+        $.ajax({
+            url: "http://localhost:8000/add-document",
+            type: "POST",
+            contentType: "application/json",
+            data: JSON.stringify(docData),
+            success: function (res) {
+                if (res.status === "success") {
+                    $("#docStatus").html(
+                        "<div class='alert alert-success'>" +
+                        "✓ Document added! (" + res.chunks_added + " chunks)" +
+                        "</div>"
+                    );
+                    $("#documentInput").val("");
+                    $("#documentId").val("");
+                }
+                else {
+                    $("#docStatus").html("<div class='alert alert-danger'>Error adding document</div>");
+                }
+            },
+            error: function () {
+                $("#docStatus").html("<div class='alert alert-danger'>Cannot reach server</div>");
+            }
+        });
+    });
+
+    // Chat Function
+    $("#sendBtn").click(function () {
         var message = $("#userInput").val();
 
         if (!message) return;
@@ -46,13 +118,13 @@
             contentType: "application/json",
             data: JSON.stringify({ message: message }),
             success: function (res) {
-
                 if (res.response) {
-
+                    var contextNote = res.context_used ? " <small class='text-muted'>[Context-Aware]</small>" : "";
+                    
                     $("#chatBox").append(
                         "<div class='text-start mb-2'>" +
                         "<div class='p-2 rounded bg-light border ai-bubble'>" +
-                        res.response +
+                        res.response + contextNote +
                         "</div></div>"
                     );
 
@@ -63,6 +135,13 @@
                 }
             }
         });
+    });
+
+    // Allow Enter key to send message
+    $("#userInput").keypress(function (e) {
+        if (e.which == 13) {
+            $("#sendBtn").click();
+        }
     });
 </script>
 }
