@@ -8,6 +8,10 @@ from ddgs import DDGS
 import chromadb
 import uuid
 
+import requests
+from bs4 import BeautifulSoup
+
+
 # =====================================================
 # FastAPI Setup
 # =====================================================
@@ -76,6 +80,7 @@ print("RAG system ready.")
 class ChatRequest(BaseModel):
     message: str
     use_web: bool = False
+    web_url: str = None   # NEW
     top_k: int = 4
 
 
@@ -183,6 +188,39 @@ def search_web(query: str, max_results: int = 5):
     return "\n\n".join(web_results)
 
 
+def fetch_webpage_content(url: str):
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+
+        response = requests.get(url, headers=headers, timeout=10)
+
+        if response.status_code != 200:
+            return ""
+
+        soup = BeautifulSoup(response.text, "lxml")
+
+        # Remove scripts & styles
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+
+        # Extract visible text
+        text = soup.get_text(separator="\n")
+
+        # Clean lines
+        lines = [line.strip() for line in text.splitlines()]
+        cleaned = "\n".join([line for line in lines if line])
+
+        # Limit very large pages
+        return cleaned[:8000]
+
+    except Exception as e:
+        print("Webpage fetch error:", e)
+        return ""
+
+
 # =====================================================
 # Build Prompt
 # =====================================================
@@ -214,8 +252,6 @@ Question:
 # Chat Endpoint
 # =====================================================
 
-@app.post("/chat")
-def chat(request: ChatRequest):
 
     internal_context = retrieve_internal_context(
         request.message,
@@ -278,6 +314,70 @@ def chat(request: ChatRequest):
         "web_used": bool(web_context)
     }
 
+@app.post("/chat")
+def chat(request: ChatRequest):
+
+    internal_context = retrieve_internal_context(
+        request.message,
+        request.top_k
+    )
+
+    webpage_context = ""
+
+    # Fetch specific webpage if URL provided
+    if request.web_url:
+        webpage_text = fetch_webpage_content(request.web_url)
+
+        if webpage_text:
+            # Optional: chunk & limit
+            chunks = chunk_text(webpage_text, chunk_size=1000, overlap=200)
+            webpage_context = "\n\n".join(chunks[:3])  # limit to first 3 chunks
+
+    combined_context = ""
+
+    if internal_context:
+        combined_context += "Internal Knowledge:\n" + internal_context + "\n\n"
+
+    if webpage_context:
+        combined_context += "Webpage Content:\n" + webpage_context
+
+    prompt = build_prompt(request.message, combined_context)
+
+    messages = [
+        {"role": "system", "content": "You are an enterprise HR system assistant."},
+        {"role": "user", "content": prompt}
+    ]
+
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    inputs = tokenizer(text, return_tensors="pt").to(DEVICE)
+    input_length = inputs["input_ids"].shape[1]
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=300,
+            temperature=0.2,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            do_sample=True
+        )
+
+    new_tokens = outputs[0][input_length:]
+    response = tokenizer.decode(
+        new_tokens,
+        skip_special_tokens=True
+    ).strip()
+
+    return {
+        "response": response,
+        "internal_context_used": bool(internal_context),
+        "webpage_used": bool(webpage_context)
+    }
 
 # =====================================================
 # Health Check
