@@ -4,7 +4,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sentence_transformers import SentenceTransformer
+from ddgs import DDGS
 import chromadb
+import uuid
 
 # =====================================================
 # FastAPI Setup
@@ -27,23 +29,24 @@ app.add_middleware(
 MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 CHROMA_DB_PATH = "./chroma_db"
+DEVICE = "cpu"  # change to "cuda" if GPU available
 
 # =====================================================
-# Load LLM (Qwen 3B)
+# Load LLM
 # =====================================================
 
-print("Loading Qwen 2.5 3B model...")
+print("Loading Qwen model...")
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
-    dtype=torch.float32
-)
+    torch_dtype=torch.float32
+).to(DEVICE)
 
-model.to("cpu")
+model.eval()
 
-print("LLM loaded successfully.")
+print("LLM loaded.")
 
 # =====================================================
 # Load Embedding Model
@@ -72,13 +75,17 @@ print("RAG system ready.")
 
 class ChatRequest(BaseModel):
     message: str
+    use_web: bool = False
+    top_k: int = 4
+
 
 class DocumentRequest(BaseModel):
     content: str
     document_id: str = None
 
+
 # =====================================================
-# Smart Chunking Function
+# Smart Chunking
 # =====================================================
 
 def chunk_text(text, chunk_size=800, overlap=150):
@@ -90,13 +97,15 @@ def chunk_text(text, chunk_size=800, overlap=150):
         start += chunk_size - overlap
     return chunks
 
+
 # =====================================================
 # Add Document Endpoint
 # =====================================================
 
 @app.post("/add-document")
 def add_document(request: DocumentRequest):
-    doc_id = request.document_id or f"doc_{collection.count()}"
+
+    doc_id = request.document_id or f"doc_{uuid.uuid4()}"
 
     chunks = chunk_text(request.content)
 
@@ -117,11 +126,13 @@ def add_document(request: DocumentRequest):
         "document_id": doc_id
     }
 
+
 # =====================================================
-# Retrieve Context
+# Retrieve Internal Context
 # =====================================================
 
-def retrieve_context(query: str, top_k: int = 4):
+def retrieve_internal_context(query: str, top_k: int):
+
     if collection.count() == 0:
         return ""
 
@@ -135,25 +146,53 @@ def retrieve_context(query: str, top_k: int = 4):
         n_results=top_k
     )
 
-    docs = results["documents"][0]
+    docs = results.get("documents", [[]])[0]
+
     if not docs:
         return ""
 
-    context = "\n\n".join([f"- {doc}" for doc in docs])
-    return context
+    return "\n\n".join([f"- {doc}" for doc in docs])
+
 
 # =====================================================
-# Chat Endpoint (Qwen Chat Template)
+# Web Search Function
 # =====================================================
 
-@app.post("/chat")
-def chat(request: ChatRequest):
+def search_web(query: str, max_results: int = 5):
 
-    context = retrieve_context(request.message)
+    web_results = []
 
-    if context:
-        user_prompt = f"""
-Use ONLY the provided internal knowledge to answer.
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.text(query, max_results=max_results)
+
+            for r in results:
+                title = r.get("title", "")
+                body = r.get("body", "")
+                url = r.get("href", "")
+
+                web_results.append(
+                    f"Title: {title}\n"
+                    f"Content: {body}\n"
+                    f"Source: {url}"
+                )
+
+    except Exception as e:
+        print("Web search error:", e)
+
+    return "\n\n".join(web_results)
+
+
+# =====================================================
+# Build Prompt
+# =====================================================
+
+def build_prompt(question: str, context: str):
+
+    return f"""
+You are an enterprise HR system assistant.
+
+Use ONLY the provided knowledge to answer.
 
 Rules:
 - Do not repeat the context.
@@ -163,34 +202,57 @@ Rules:
 - If answer is not found, say:
   "The requested information is not available in the system."
 
-Internal Knowledge:
+Knowledge:
 {context}
 
 Question:
-{request.message}
+{question}
 """
-    else:
-        user_prompt = request.message
+
+
+# =====================================================
+# Chat Endpoint
+# =====================================================
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+
+    internal_context = retrieve_internal_context(
+        request.message,
+        request.top_k
+    )
+
+    web_context = ""
+
+    if request.use_web:
+        web_context = search_web(request.message)
+
+    # Combine context safely
+    combined_context = ""
+
+    if internal_context:
+        combined_context += "Internal Knowledge:\n" + internal_context + "\n\n"
+
+    if web_context:
+        combined_context += "Web Knowledge:\n" + web_context
+
+    if not combined_context:
+        combined_context = ""
+
+    prompt = build_prompt(request.message, combined_context)
 
     messages = [
-        {
-            "role": "system",
-            "content": "You are an enterprise HR system assistant."
-        },
-        {
-            "role": "user",
-            "content": user_prompt
-        }
+        {"role": "system", "content": "You are an enterprise HR system assistant."},
+        {"role": "user", "content": prompt}
     ]
 
-    # Proper Qwen chat formatting
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
     )
 
-    inputs = tokenizer(text, return_tensors="pt")
+    inputs = tokenizer(text, return_tensors="pt").to(DEVICE)
 
     input_length = inputs["input_ids"].shape[1]
 
@@ -198,17 +260,29 @@ Question:
         outputs = model.generate(
             **inputs,
             max_new_tokens=300,
-            temperature=0.1,
-            top_p=0.8,
-            repetition_penalty=1.2,
+            temperature=0.2,
+            top_p=0.9,
+            repetition_penalty=1.1,
             do_sample=True
         )
 
     new_tokens = outputs[0][input_length:]
-    response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
+    response = tokenizer.decode(
+        new_tokens,
+        skip_special_tokens=True
+    ).strip()
 
     return {
         "response": response,
-        "context_used": bool(context)
+        "internal_context_used": bool(internal_context),
+        "web_used": bool(web_context)
     }
+
+
+# =====================================================
+# Health Check
+# =====================================================
+
+@app.get("/")
+def root():
+    return {"status": "Hybrid RAG + Web Search system running"}
